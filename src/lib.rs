@@ -64,7 +64,7 @@ pub enum Error {
     Xdg(#[from] xdg::BaseDirectoriesError),
 
     #[cfg(target_os = "windows")]
-    #[error("system call failed")]
+    #[error("Windows system call failed: {0}")]
     SystemCall(#[from] windows::Win32Error),
 }
 
