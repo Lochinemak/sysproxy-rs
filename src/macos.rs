@@ -1,4 +1,4 @@
-use crate::{Autoproxy, Error, Result, Sysproxy, WriteProgress};
+use crate::{Autoproxy, Error, ProxyEndpoint, ProxySnapshot, Result, Sysproxy, WriteProgress};
 use log::debug;
 use std::process::{Command, Output, Stdio};
 use system_configuration::{
@@ -112,6 +112,37 @@ impl Sysproxy {
         }
 
         Ok(socks)
+    }
+
+    /// Read every protocol separately, plus PAC and the bypass list.
+    ///
+    /// Protocols share the flattened getter's dictionary; PAC uses the dynamic store.
+    #[inline]
+    pub fn snapshot() -> Result<ProxySnapshot> {
+        let service_uuid = get_active_network_service_uuid()?;
+        let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+        let proxies_dict = get_proxies_by_service_uuid(&scp, &service_uuid)?;
+
+        let store = SCDynamicStoreBuilder::new("sysproxy-rs")
+            .build()
+            .ok_or(Error::SCDynamicStore)?;
+
+        let endpoint = |proxy_type| -> Result<ProxyEndpoint> {
+            let parsed = parse_proxies_from_dict(&proxies_dict, proxy_type)?;
+            Ok(ProxyEndpoint {
+                host: parsed.host,
+                port: parsed.port,
+                enable: parsed.enable,
+            })
+        };
+
+        Ok(ProxySnapshot {
+            socks: endpoint(ProxyType::Socks)?,
+            http: endpoint(ProxyType::Http)?,
+            https: endpoint(ProxyType::Https)?,
+            auto: get_autoproxies_by_service_uuid(&store, &service_uuid)?,
+            bypass: parse_bypass_from_dict(&proxies_dict)?.join(","),
+        })
     }
 
     #[inline]
