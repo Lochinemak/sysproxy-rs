@@ -376,7 +376,10 @@ mod tests {
 
     #[test]
     fn test_hostname_with_port() {
-        assert_eq!(parse("proxy.example.com:3128"), ("proxy.example.com".into(), 3128));
+        assert_eq!(
+            parse("proxy.example.com:3128"),
+            ("proxy.example.com".into(), 3128)
+        );
     }
 
     #[test]
