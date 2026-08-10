@@ -252,9 +252,15 @@ impl Autoproxy {
     }
 }
 
+/// Fixed path prevents `PATH` substitution in privileged callers.
+const NETWORKSETUP: &str = "/usr/sbin/networksetup";
+
+/// Admin-required exit code observed from `networksetup` on macOS 26.6.1.
+const EXIT_REQUIRES_ADMIN: i32 = 14;
+
 #[inline]
 fn run_networksetup<'a>(args: &[&str]) -> Result<Cow<'a, str>> {
-    let output = Command::new("networksetup")
+    let output = Command::new(NETWORKSETUP)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -265,17 +271,22 @@ fn run_networksetup<'a>(args: &[&str]) -> Result<Cow<'a, str>> {
 
 #[inline]
 fn parse_networksetup_output<'a>(args: &[&str], output: Output) -> Result<Cow<'a, str>> {
-    let stdout = from_utf8(&output.stdout).map_err(|_| Error::ParseStr("output".into()))?;
-    let stderr = from_utf8(&output.stderr).map_err(|_| Error::ParseStr("error output".into()))?;
-
     if !output.status.success() {
+        // Keep the exit status usable even when failure output is not UTF-8.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // `networksetup` may report failures on either stream.
         let details = [stdout.trim(), stderr.trim()]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
 
-        if details.contains("requires admin privileges") {
+        // Match both signals; exit code 2 is an authentication failure, not missing privileges.
+        if details.contains("requires admin privileges")
+            || output.status.code() == Some(EXIT_REQUIRES_ADMIN)
+        {
             log::error!(
                 "Admin privileges required to run networksetup with args: {:?}, error: {}",
                 args,
@@ -296,6 +307,7 @@ fn parse_networksetup_output<'a>(args: &[&str], output: Output) -> Result<Cow<'a
         )));
     }
 
+    let stdout = from_utf8(&output.stdout).map_err(|_| Error::ParseStr("output".into()))?;
     Ok(Cow::Owned(stdout.to_string()))
 }
 
@@ -693,4 +705,93 @@ fn parse_proxyauto_disable_when_url_missing() {
     let auto = parse_proxyauto_from_dict(&dict).unwrap();
     assert!(!auto.enable);
     assert_eq!(auto.url, "");
+}
+
+/// Build an `ExitStatus` without running `networksetup`.
+#[cfg(test)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
+#[test]
+fn admin_failure_is_recognised_from_the_exit_code_alone() {
+    let output = Output {
+        status: exit_status(EXIT_REQUIRES_ADMIN),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+
+    assert!(matches!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+        Err(Error::RequiresAdminPrivileges)
+    ));
+}
+
+#[test]
+fn admin_failure_is_recognised_from_the_message_alone() {
+    let output = Output {
+        status: exit_status(1),
+        stdout: b"** Error: Command requires admin privileges.".to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert!(matches!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+        Err(Error::RequiresAdminPrivileges)
+    ));
+}
+
+#[test]
+fn authentication_failures_are_not_reported_as_missing_admin_rights() {
+    let output = Output {
+        status: exit_status(2),
+        stdout: b"** Error: An error occurred while authenticating.".to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert!(matches!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+        Err(Error::NetworkSetup(_))
+    ));
+}
+
+#[test]
+fn only_the_admin_exit_code_is_treated_as_a_privilege_failure() {
+    assert_eq!(EXIT_REQUIRES_ADMIN, 14);
+
+    for code in [13, 15] {
+        let output = Output {
+            status: exit_status(code),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+
+        assert!(
+            matches!(
+                parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+                Err(Error::NetworkSetup(_))
+            ),
+            "exit code {code} must not be classified as a privilege failure"
+        );
+    }
+}
+
+#[test]
+fn the_exit_code_still_classifies_when_the_output_is_not_valid_utf8() {
+    for (stdout, stderr) in [
+        (vec![0xff, 0xfe, 0x00], Vec::new()),
+        (Vec::new(), vec![0xff, 0xfe, 0x00]),
+    ] {
+        let output = Output {
+            status: exit_status(EXIT_REQUIRES_ADMIN),
+            stdout,
+            stderr,
+        };
+
+        assert!(matches!(
+            parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+            Err(Error::RequiresAdminPrivileges)
+        ));
+    }
 }
