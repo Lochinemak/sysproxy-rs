@@ -1,10 +1,6 @@
-use crate::{Autoproxy, Error, Result, Sysproxy};
+use crate::{Autoproxy, Error, Result, Sysproxy, WriteProgress};
 use log::debug;
-use std::{
-    borrow::Cow,
-    process::{Command, Output, Stdio},
-    str::from_utf8,
-};
+use std::process::{Command, Output, Stdio};
 use system_configuration::{
     core_foundation::dictionary::CFDictionary, dynamic_store::SCDynamicStore,
     preferences::SCPreferences,
@@ -126,17 +122,20 @@ impl Sysproxy {
 
         debug!("Use network service: {}", service);
 
+        // Keep one progress counter across all protocol writes.
+        let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
         debug!("Setting SOCKS proxy");
-        self.set_socks(service)?;
+        set_proxy(&mut writes, self, ProxyType::Socks, service)?;
 
         debug!("Setting HTTPS proxy");
-        self.set_https(service)?;
+        set_proxy(&mut writes, self, ProxyType::Https, service)?;
 
         debug!("Setting HTTP proxy");
-        self.set_http(service)?;
+        set_proxy(&mut writes, self, ProxyType::Http, service)?;
 
         debug!("Setting bypass domains");
-        self.set_bypass(service)?;
+        set_bypass(&mut writes, self, service)?;
         Ok(())
     }
 
@@ -191,22 +190,37 @@ impl Sysproxy {
 
     #[inline]
     pub fn set_http(&self, service: &str) -> Result<()> {
-        set_proxy(self, ProxyType::Http, service)
+        set_proxy(
+            &mut WriteSequence::new(WRITES_PER_PROXY_TYPE),
+            self,
+            ProxyType::Http,
+            service,
+        )
     }
 
     #[inline]
     pub fn set_https(&self, service: &str) -> Result<()> {
-        set_proxy(self, ProxyType::Https, service)
+        set_proxy(
+            &mut WriteSequence::new(WRITES_PER_PROXY_TYPE),
+            self,
+            ProxyType::Https,
+            service,
+        )
     }
 
     #[inline]
     pub fn set_socks(&self, service: &str) -> Result<()> {
-        set_proxy(self, ProxyType::Socks, service)
+        set_proxy(
+            &mut WriteSequence::new(WRITES_PER_PROXY_TYPE),
+            self,
+            ProxyType::Socks,
+            service,
+        )
     }
 
     #[inline]
     pub fn set_bypass(&self, service: &str) -> Result<()> {
-        set_bypass(self, service)
+        set_bypass(&mut WriteSequence::new(BYPASS_WRITES), self, service)
     }
 
     /// Try to lock `SCPreferences` without waiting.
@@ -250,8 +264,9 @@ impl Autoproxy {
         } else {
             &self.url
         };
-        run_networksetup(&["-setautoproxyurl", service, url])?;
-        run_networksetup(&["-setautoproxystate", service, enable])?;
+        let mut writes = WriteSequence::new(AUTO_PROXY_WRITES);
+        writes.run(&["-setautoproxyurl", service, url])?;
+        writes.run(&["-setautoproxystate", service, enable])?;
 
         Ok(())
     }
@@ -263,8 +278,51 @@ const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 /// Admin-required exit code observed from `networksetup` on macOS 26.6.1.
 const EXIT_REQUIRES_ADMIN: i32 = 14;
 
+const WRITES_PER_PROXY_TYPE: u8 = 2;
+const SYSTEM_PROXY_WRITES: u8 = 3 * WRITES_PER_PROXY_TYPE + 1;
+const AUTO_PROXY_WRITES: u8 = 2;
+const BYPASS_WRITES: u8 = 1;
+
+/// Tracks accepted writes in one logical operation.
+struct WriteSequence {
+    completed: u8,
+    total: u8,
+}
+
+impl WriteSequence {
+    #[inline]
+    const fn new(total: u8) -> Self {
+        Self {
+            completed: 0,
+            total,
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, outcome: Result<()>) -> Result<()> {
+        match outcome {
+            Ok(()) => {
+                self.completed += 1;
+                Ok(())
+            }
+            Err(source) => Err(Error::ProxyWrite {
+                progress: WriteProgress {
+                    completed: self.completed,
+                    total: self.total,
+                },
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    #[inline]
+    fn run(&mut self, args: &[&str]) -> Result<()> {
+        self.record(run_networksetup(args))
+    }
+}
+
 #[inline]
-fn run_networksetup<'a>(args: &[&str]) -> Result<Cow<'a, str>> {
+fn run_networksetup(args: &[&str]) -> Result<()> {
     let output = Command::new(NETWORKSETUP)
         .args(args)
         .stdout(Stdio::piped())
@@ -275,7 +333,7 @@ fn run_networksetup<'a>(args: &[&str]) -> Result<Cow<'a, str>> {
 }
 
 #[inline]
-fn parse_networksetup_output<'a>(args: &[&str], output: Output) -> Result<Cow<'a, str>> {
+fn parse_networksetup_output(args: &[&str], output: Output) -> Result<()> {
     if !output.status.success() {
         // Keep the exit status usable even when failure output is not UTF-8.
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -312,27 +370,32 @@ fn parse_networksetup_output<'a>(args: &[&str], output: Output) -> Result<Cow<'a
         )));
     }
 
-    let stdout = from_utf8(&output.stdout).map_err(|_| Error::ParseStr("output".into()))?;
-    Ok(Cow::Owned(stdout.to_string()))
+    // Successful write output is unused and must not affect progress.
+    Ok(())
 }
 
 #[inline]
-fn set_proxy(proxy: &Sysproxy, proxy_type: ProxyType, service: &str) -> Result<()> {
+fn set_proxy(
+    writes: &mut WriteSequence,
+    proxy: &Sysproxy,
+    proxy_type: ProxyType,
+    service: &str,
+) -> Result<()> {
     let host = proxy.host.as_str();
     let port = format!("{}", proxy.port);
     let port = port.as_str();
 
-    run_networksetup(&[proxy_type.as_set_str(), service, host, port])?;
+    writes.run(&[proxy_type.as_set_str(), service, host, port])?;
 
     let enable = if proxy.enable { "on" } else { "off" };
 
-    run_networksetup(&[proxy_type.as_state_cmd(), service, enable])?;
+    writes.run(&[proxy_type.as_state_cmd(), service, enable])?;
 
     Ok(())
 }
 
 #[inline]
-fn set_bypass(proxy: &Sysproxy, service: &str) -> Result<()> {
+fn set_bypass(writes: &mut WriteSequence, proxy: &Sysproxy, service: &str) -> Result<()> {
     let mut args = vec!["-setproxybypassdomains", service];
     let domains: Vec<&str> = if proxy.bypass.is_empty() {
         Vec::new()
@@ -340,7 +403,7 @@ fn set_bypass(proxy: &Sysproxy, service: &str) -> Result<()> {
         proxy.bypass.split(",").collect()
     };
     args.extend(&domains);
-    run_networksetup(&args)?;
+    writes.run(&args)?;
     Ok(())
 }
 
@@ -589,7 +652,10 @@ fn test_set_bypass() {
     };
     let result = proxy.set_bypass("Wi-Fi");
     if let Err(e) = result {
-        assert!(matches!(e, Error::RequiresAdminPrivileges));
+        assert!(matches!(
+            leaf_error(&e),
+            Some(Error::RequiresAdminPrivileges)
+        ));
     }
 }
 
@@ -800,4 +866,121 @@ fn the_exit_code_still_classifies_when_the_output_is_not_valid_utf8() {
             Err(Error::RequiresAdminPrivileges)
         ));
     }
+}
+
+#[test]
+fn a_failure_before_any_write_reports_that_nothing_landed() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    assert!(
+        matches!(
+            &failure,
+            Some(Error::ProxyWrite { progress, .. })
+                if progress.nothing_written() && progress.total() == SYSTEM_PROXY_WRITES
+        ),
+        "unexpected failure shape: {failure:?}"
+    );
+}
+
+#[test]
+fn progress_counts_the_writes_that_already_landed() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    assert!(writes.record(Ok(())).is_ok());
+    assert!(writes.record(Ok(())).is_ok());
+    assert!(writes.record(Ok(())).is_ok());
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    assert!(
+        matches!(
+            &failure,
+            Some(Error::ProxyWrite { progress, .. })
+                if !progress.nothing_written() && progress.completed() == 3
+        ),
+        "unexpected failure shape: {failure:?}"
+    );
+}
+
+/// Return the first crate error in an error's source chain.
+#[cfg(test)]
+fn leaf_error(err: &Error) -> Option<&Error> {
+    use std::error::Error as StdError;
+
+    let mut current: Option<&(dyn StdError + 'static)> = StdError::source(err);
+    while let Some(source) = current {
+        if let Some(leaf) = source.downcast_ref::<Error>() {
+            return Some(leaf);
+        }
+        current = source.source();
+    }
+    None
+}
+
+#[test]
+fn the_underlying_failure_stays_reachable_through_the_source_chain() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    let reached = failure.as_ref().and_then(leaf_error);
+    assert!(
+        matches!(reached, Some(Error::RequiresAdminPrivileges)),
+        "leaf not reachable through the source chain: {failure:?}"
+    );
+}
+
+#[test]
+fn the_wrapper_does_not_repeat_the_leaf_message() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+    let rendered = failure.map(|err| err.to_string()).unwrap_or_default();
+
+    assert!(
+        !rendered.contains("admin privileges"),
+        "wrapper Display should not inline the leaf: {rendered}"
+    );
+    assert!(rendered.contains("0 of 7 writes completed"), "{rendered}");
+}
+
+#[test]
+fn a_successful_write_is_not_failed_by_output_it_cannot_decode() {
+    let output = Output {
+        status: exit_status(0),
+        stdout: vec![0xff, 0xfe, 0x00],
+        stderr: vec![0xff, 0xfe, 0x00],
+    };
+
+    assert!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output).is_ok(),
+        "a command that exited 0 must be reported as success"
+    );
+}
+
+#[test]
+fn a_successful_write_advances_the_progress_counter() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let accepted = parse_networksetup_output(
+        &["-setwebproxystate", "Wi-Fi", "off"],
+        Output {
+            status: exit_status(0),
+            stdout: vec![0xff, 0xfe, 0x00],
+            stderr: Vec::new(),
+        },
+    );
+    assert!(writes.record(accepted).is_ok());
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    assert!(
+        matches!(
+            &failure,
+            Some(Error::ProxyWrite { progress, .. }) if progress.completed() == 1
+        ),
+        "unexpected failure shape: {failure:?}"
+    );
 }

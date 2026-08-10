@@ -30,6 +30,42 @@ pub struct Autoproxy {
     pub enable: bool,
 }
 
+/// How far a multi-step proxy write got before it failed.
+///
+/// macOS proxy writes span several commands, so failures may leave partial state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteProgress {
+    pub(crate) completed: u8,
+    pub(crate) total: u8,
+}
+
+impl WriteProgress {
+    /// Writes that were accepted by the OS before the failure.
+    #[inline]
+    pub const fn completed(&self) -> u8 {
+        self.completed
+    }
+
+    /// Writes the attempted sequence performs in total.
+    #[inline]
+    pub const fn total(&self) -> u8 {
+        self.total
+    }
+
+    /// Whether no write was accepted before the failure.
+    #[inline]
+    pub const fn nothing_written(&self) -> bool {
+        self.completed == 0
+    }
+}
+
+impl std::fmt::Display for WriteProgress {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} of {} writes completed", self.completed, self.total)
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("failed to parse string `{0}`")]
@@ -46,6 +82,14 @@ pub enum Error {
 
     #[error("admin privileges required to modify system proxy")]
     RequiresAdminPrivileges,
+
+    /// A failed multi-step write. Inspect the source chain for the underlying [`Error`].
+    #[error("proxy write failed ({progress})")]
+    ProxyWrite {
+        progress: WriteProgress,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 
     #[cfg(target_os = "macos")]
     #[error("failed to interact with SCPreferences")]
