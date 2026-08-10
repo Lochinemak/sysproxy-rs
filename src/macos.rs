@@ -209,8 +209,11 @@ impl Sysproxy {
         set_bypass(self, service)
     }
 
+    /// Try to lock `SCPreferences` without waiting.
+    ///
+    /// This does not predict whether authorized `networksetup` writes will succeed.
     #[inline]
-    pub fn has_permission() -> bool {
+    pub fn can_lock_scpreferences() -> bool {
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
         unsafe {
             let locked = SCPreferencesLock(scp.as_concrete_TypeRef(), 0);
@@ -218,7 +221,9 @@ impl Sysproxy {
                 SCPreferencesUnlock(scp.as_concrete_TypeRef());
                 true
             } else {
-                debug!("Permission check failed: SCPreferencesLock returned false");
+                debug!(
+                    "SCPreferencesLock returned false; this says nothing about write permission"
+                );
                 false
             }
         }
@@ -572,7 +577,9 @@ fn test_get_service_id_by_display_name() {
     println!("proxies: {:?}", proxies);
 }
 
+/// Destructive and machine-dependent: changes the real Wi-Fi bypass list without restoring it.
 #[test]
+#[ignore = "destructive: rewrites the machine's real Wi-Fi bypass list without restoring it"]
 fn test_set_bypass() {
     let proxy = Sysproxy {
         host: "proxy.example.com".into(),
@@ -583,7 +590,6 @@ fn test_set_bypass() {
     let result = proxy.set_bypass("Wi-Fi");
     if let Err(e) = result {
         assert!(matches!(e, Error::RequiresAdminPrivileges));
-        assert!(!Sysproxy::has_permission());
     }
 }
 
