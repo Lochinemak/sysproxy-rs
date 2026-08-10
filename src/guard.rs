@@ -8,7 +8,7 @@ use std::{
 };
 
 use log::{debug, error};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::{Autoproxy, Sysproxy};
 
@@ -78,10 +78,61 @@ impl fmt::Display for GuardState {
     }
 }
 
+/// What one guard check did.
+///
+/// The monitor reports every check; callers decide failure policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardOutcome {
+    /// The OS already matched the target; nothing was written.
+    Matched,
+    /// The OS had drifted and was rewritten successfully.
+    Rewritten,
+    /// The current OS state could not be read, so drift could not be judged.
+    ReadFailed(String),
+    /// The OS had drifted, and rewriting it failed.
+    WriteFailed(String),
+}
+
+/// Observes when no monitor loop is running.
+///
+/// The shared signal supports multiple waiters and survives timeouts.
+#[must_use = "a shutdown is only requested until it is awaited"]
+pub struct GuardIdle {
+    idle: watch::Receiver<bool>,
+}
+
+impl GuardIdle {
+    /// Wait until no loop is running; return `false` on timeout.
+    #[inline]
+    pub async fn wait_timeout(mut self, timeout: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(timeout, self.idle.wait_for(|idle| *idle)).await,
+            Ok(Ok(_))
+        )
+    }
+}
+
+/// Marks a run stopped and idle on every task exit path, including pre-poll drops.
+struct RunGuard {
+    guard_stat: Arc<AtomicU8>,
+    idle: Arc<watch::Sender<bool>>,
+}
+
+impl Drop for RunGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // Publish Stopped before waking idle waiters.
+        self.guard_stat
+            .store(GuardState::Stopped as u8, Ordering::Release);
+        self.idle.send_replace(true);
+    }
+}
+
 #[derive(Clone)]
 struct TaskConfig {
     guard_type: GuardType,
     interval: Duration,
+    outcomes: Option<mpsc::UnboundedSender<GuardOutcome>>,
 }
 
 pub struct GuardMonitor {
@@ -89,6 +140,9 @@ pub struct GuardMonitor {
     interval: Duration,
     notify: Arc<Notify>,
     guard_stat: Arc<AtomicU8>,
+    outcomes: Option<mpsc::UnboundedSender<GuardOutcome>>,
+    /// `true` while no loop is running.
+    idle: Arc<watch::Sender<bool>>,
 }
 
 impl Drop for GuardMonitor {
@@ -115,7 +169,35 @@ impl GuardMonitor {
             interval,
             notify: Arc::new(Notify::new()),
             guard_stat: Arc::new(AtomicU8::new(GuardState::Stopped as u8)),
+            outcomes: None,
+            idle: Arc::new(watch::Sender::new(true)),
         }
+    }
+
+    /// Receive the outcome of every check the monitor performs.
+    ///
+    /// Set before [`start`](Self::start); dropping the receiver only stops reporting.
+    #[inline]
+    pub fn set_outcome_sender(&mut self, sender: Option<mpsc::UnboundedSender<GuardOutcome>>) {
+        self.outcomes = sender;
+    }
+
+    /// Observe when no loop is running, without asking one to stop.
+    #[inline]
+    pub fn idle(&self) -> GuardIdle {
+        GuardIdle {
+            idle: self.idle.subscribe(),
+        }
+    }
+
+    /// Ask the monitor to stop and hand back an observer for when it has actually finished.
+    ///
+    /// Call synchronously, release any monitor lock, then await the observer.
+    #[inline]
+    #[must_use = "shutdown only requests a stop; await the returned observer to know it finished"]
+    pub fn shutdown(&self) -> GuardIdle {
+        self.stop();
+        self.idle()
     }
 
     #[inline]
@@ -152,51 +234,93 @@ impl GuardMonitor {
     }
 
     #[inline]
-    fn guard_sysproxy_static(sysproxy: &Sysproxy) {
-        if let Ok(actually_sysproxy) = Sysproxy::get_system_proxy()
-            && &actually_sysproxy != sysproxy
-        {
-            debug!(
-                "Sysproxy settings do not match! Expected: {:?}, Actual: {:?}",
-                sysproxy, actually_sysproxy
-            );
-            debug!("Resetting Sysproxy to: {:?}", sysproxy);
-            if let Err(e) = sysproxy.set_system_proxy() {
+    fn guard_sysproxy_static(sysproxy: &Sysproxy) -> GuardOutcome {
+        // Report read failures instead of silently skipping checks.
+        let actually_sysproxy = match Sysproxy::get_system_proxy() {
+            Ok(actual) => actual,
+            Err(e) => {
+                error!("Failed to read system proxy: {:?}", e);
+                return GuardOutcome::ReadFailed(e.to_string());
+            }
+        };
+
+        if &actually_sysproxy == sysproxy {
+            return GuardOutcome::Matched;
+        }
+
+        debug!(
+            "Sysproxy settings do not match! Expected: {:?}, Actual: {:?}",
+            sysproxy, actually_sysproxy
+        );
+        debug!("Resetting Sysproxy to: {:?}", sysproxy);
+        match sysproxy.set_system_proxy() {
+            Ok(()) => GuardOutcome::Rewritten,
+            Err(e) => {
                 error!("Failed to set system proxy: {:?}", e);
+                GuardOutcome::WriteFailed(e.to_string())
             }
         }
     }
 
     #[inline]
-    fn guard_autoproxy_static(autoproxy: &Autoproxy) {
-        if let Ok(actually_autoproxy) = Autoproxy::get_auto_proxy()
-            && &actually_autoproxy != autoproxy
-        {
-            debug!(
-                "Autoproxy settings do not match! Expected: {:?}, Actual: {:?}",
-                autoproxy, actually_autoproxy
-            );
-            debug!("Resetting Autoproxy to: {:?}", autoproxy);
-            if let Err(e) = autoproxy.set_auto_proxy() {
+    fn guard_autoproxy_static(autoproxy: &Autoproxy) -> GuardOutcome {
+        let actually_autoproxy = match Autoproxy::get_auto_proxy() {
+            Ok(actual) => actual,
+            Err(e) => {
+                error!("Failed to read auto proxy: {:?}", e);
+                return GuardOutcome::ReadFailed(e.to_string());
+            }
+        };
+
+        if &actually_autoproxy == autoproxy {
+            return GuardOutcome::Matched;
+        }
+
+        debug!(
+            "Autoproxy settings do not match! Expected: {:?}, Actual: {:?}",
+            autoproxy, actually_autoproxy
+        );
+        debug!("Resetting Autoproxy to: {:?}", autoproxy);
+        match autoproxy.set_auto_proxy() {
+            Ok(()) => GuardOutcome::Rewritten,
+            Err(e) => {
                 error!("Failed to set auto proxy: {:?}", e);
+                GuardOutcome::WriteFailed(e.to_string())
             }
         }
     }
 
     #[inline]
-    pub fn start(&self) {
+    /// Start the monitor loop. Returns whether a loop was actually started.
+    ///
+    /// Returns `false` if a loop is active or the previous run is still draining.
+    pub fn start(&self) -> bool {
         debug!("Starting GuardMonitor...");
 
         let state = self.get_state();
         if state.is_running() || state.is_pendding() {
             debug!("GuardMonitor is already running or pending, skipping start.");
-            return;
+            return false;
         }
 
         if self.get_state().is_need_restart() {
             debug!("GuardMonitor is in NeedRestart state, stopping and restarting...");
             self.stop();
             std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Atomically reserve the idle slot; Stopped runs may still be draining.
+        let claimed = self.idle.send_if_modified(|idle| {
+            if *idle {
+                *idle = false;
+                true
+            } else {
+                false
+            }
+        });
+        if !claimed {
+            log::warn!("GuardMonitor's previous run has not finished yet; not starting.");
+            return false;
         }
 
         if self
@@ -210,20 +334,29 @@ impl GuardMonitor {
             .is_err()
         {
             debug!("GuardMonitor is not in Stopped state, skipping start.");
-            return;
+            self.idle.send_replace(true);
+            return false;
         }
 
         let config = TaskConfig {
             guard_type: self.guard_type.clone(),
             interval: self.interval,
+            outcomes: self.outcomes.clone(),
         };
         let guard_stat = Arc::clone(&self.guard_stat);
         let notify = Arc::clone(&self.notify);
+        let run_guard = RunGuard {
+            guard_stat: Arc::clone(&self.guard_stat),
+            idle: Arc::clone(&self.idle),
+        };
         tokio::spawn(async move {
+            // Captured so pre-poll task drops still release the run.
+            let _run_guard = run_guard;
             Self::run_monitor_loop(guard_stat, notify, config).await;
         });
 
         debug!("GuardMonitor spawned successfully.");
+        true
     }
 
     #[inline]
@@ -231,7 +364,19 @@ impl GuardMonitor {
         let mut interval = tokio::time::interval(config.interval);
         debug!("GuardMonitor started with interval: {:?}", config.interval);
 
-        guard_stat.store(GuardState::Running as u8, Ordering::Release);
+        // Claim Pending only if no stop arrived after spawning.
+        if guard_stat
+            .compare_exchange(
+                GuardState::Pending as u8,
+                GuardState::Running as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            debug!("GuardMonitor was stopped before it started; exiting without checking.");
+            return;
+        }
 
         loop {
             let state = GuardState::from_u8(guard_stat.load(Ordering::Acquire));
@@ -245,18 +390,24 @@ impl GuardMonitor {
 
             tokio::select! {
                 _ = interval.tick() => {
-                    match &config.guard_type {
+                    let outcome = match &config.guard_type {
                         GuardType::Sysproxy(sysproxy) => {
                             debug!("GuardMonitor checking Sysproxy: {:?}", sysproxy);
-                            Self::guard_sysproxy_static(sysproxy);
+                            Some(Self::guard_sysproxy_static(sysproxy))
                         }
                         GuardType::Autoproxy(autoproxy) => {
                             debug!("GuardMonitor checking Autoproxy: {:?}", autoproxy);
-                            Self::guard_autoproxy_static(autoproxy);
+                            Some(Self::guard_autoproxy_static(autoproxy))
                         }
                         GuardType::None => {
                             debug!("GuardMonitor has no GuardType set, skipping check.");
+                            None
                         }
+                    };
+
+                    // A dropped receiver just ends the reporting; it must not end the guard.
+                    if let (Some(outcome), Some(sender)) = (outcome, config.outcomes.as_ref()) {
+                        let _ = sender.send(outcome);
                     }
                 }
                 _ = notify.notified() => {
@@ -265,17 +416,15 @@ impl GuardMonitor {
                 }
             }
         }
-
-        guard_stat.store(GuardState::Stopped as u8, Ordering::Release);
     }
 
     #[inline]
     pub fn stop(&self) {
         debug!("Stopping GuardMonitor...");
 
-        let state = self.get_state();
-        if state.is_stopped() || state.is_pendding() {
-            debug!("GuardMonitor is already stopped or pending, skipping stop.");
+        // Pending tasks must observe Stopped before claiming the run.
+        if self.get_state().is_stopped() {
+            debug!("GuardMonitor is already stopped, skipping stop.");
             return;
         }
 
@@ -323,15 +472,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_guard_monitor_start_stop() {
-        let target_auto_proxy = Autoproxy {
-            url: "http://example.com/proxy.pac".to_string(),
-            enable: true,
-        };
-
-        let guard_monitor = GuardMonitor::new(
-            GuardType::Autoproxy(target_auto_proxy),
-            Duration::from_millis(100),
-        );
+        // None avoids touching the machine on the immediate first tick.
+        let guard_monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(100));
 
         let monitor = Arc::new(guard_monitor);
         let monitor_clone = Arc::clone(&monitor);
@@ -575,13 +717,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_need_restart_state_stops_monitor() {
-        let monitor = GuardMonitor::new(
-            GuardType::Autoproxy(Autoproxy {
-                url: "http://example.com/proxy.pac".to_string(),
-                enable: true,
-            }),
-            Duration::from_millis(50),
-        );
+        // None keeps this state-machine test off the real proxy settings.
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(50));
 
         let monitor_arc = Arc::new(monitor);
 
@@ -764,5 +901,175 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(monitor.get_state().is_stopped());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_loop_to_actually_exit() {
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(20));
+        monitor.start();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(monitor.get_state().is_running());
+
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await,
+            "the loop should have exited well within the timeout"
+        );
+        assert!(monitor.get_state().is_stopped());
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_the_pending_window_is_not_lost() {
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(20));
+        monitor.start();
+
+        // The spawned task has not claimed its slot yet.
+        assert!(monitor.get_state().is_pendding());
+
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await,
+            "a shutdown requested before the loop started must still resolve"
+        );
+        assert!(monitor.get_state().is_stopped());
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent() {
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(20));
+        monitor.start();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guard_with_nothing_to_watch_reports_nothing() {
+        // None tests reporting without touching the machine.
+        let (sender, mut outcomes) = mpsc::unbounded_channel();
+        let mut monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(10));
+        monitor.set_outcome_sender(Some(sender));
+
+        monitor.start();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
+
+        assert!(
+            outcomes.try_recv().is_err(),
+            "a guard with no target has nothing to report"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_on_a_loop_nobody_asked_to_stop_times_out() {
+        // Multi-threaded so the loop is running independently.
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_secs(3600));
+        monitor.start();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(monitor.get_state().is_running());
+
+        assert!(
+            !monitor
+                .idle()
+                .wait_timeout(Duration::from_millis(100))
+                .await,
+            "a running loop must not be reported as finished"
+        );
+
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_that_timed_out_does_not_poison_later_waits() {
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_secs(3600));
+        monitor.start();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!monitor.idle().wait_timeout(Duration::from_millis(50)).await);
+
+        // A timeout must not consume the shared idle signal.
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn start_is_refused_while_the_previous_run_is_still_draining() {
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(20));
+        monitor.start();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(monitor.get_state().is_running());
+
+        // Stopped can precede the loop's actual exit.
+        monitor.stop();
+        assert!(monitor.get_state().is_stopped());
+
+        // Refuse overlapping loops and report the refusal.
+        assert!(
+            !monitor.start(),
+            "a start refused because the previous run is draining must say so"
+        );
+        assert!(monitor.get_state().is_stopped());
+
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_that_actually_starts_says_so() {
+        let monitor = GuardMonitor::new(GuardType::None, Duration::from_millis(20));
+
+        assert!(monitor.start(), "the first start should succeed");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(monitor.get_state().is_running());
+
+        assert!(!monitor.start(), "starting a second loop must be refused");
+
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
+
+        assert!(monitor.start(), "a drained monitor should start again");
+        assert!(
+            monitor
+                .shutdown()
+                .wait_timeout(Duration::from_secs(2))
+                .await
+        );
     }
 }
