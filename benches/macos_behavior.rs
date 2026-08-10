@@ -41,8 +41,10 @@ fn bench_get_bypass(c: &mut Criterion) {
     });
 }
 
-fn bench_has_permission(c: &mut Criterion) {
-    c.bench_function("has_permission", |b| b.iter(Sysproxy::has_permission));
+fn bench_can_lock_scpreferences(c: &mut Criterion) {
+    c.bench_function("can_lock_scpreferences", |b| {
+        b.iter(Sysproxy::can_lock_scpreferences)
+    });
 }
 
 fn bench_set_http(c: &mut Criterion) {
@@ -127,7 +129,7 @@ criterion_group! {
         bench_get_https,
         bench_get_socks,
         bench_get_bypass,
-        bench_has_permission,
+        bench_can_lock_scpreferences,
         bench_set_http,
         bench_set_https,
         bench_set_socks,
