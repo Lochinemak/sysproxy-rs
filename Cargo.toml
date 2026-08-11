@@ -25,6 +25,7 @@ url = "2.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xdg = "3.0"
+which = "8.0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.7"

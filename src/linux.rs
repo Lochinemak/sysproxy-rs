@@ -262,20 +262,14 @@ impl Sysproxy {
 }
 
 fn get_command(cmd: &str) -> Result<Command> {
-    let command_exists = Command::new("command")
-        .args(["-v", cmd])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if command_exists {
-        let mut command = Command::new(cmd);
-        if *IS_APPIMAGE {
-            command.env_remove("LD_LIBRARY_PATH");
-        }
-        Ok(command)
-    } else {
-        Err(Error::MissingCommand(cmd.into()))
+    // which 会返回完整的路径，如果找不到会报错
+    let path = which::which(cmd).map_err(|_| Error::MissingCommand(cmd.into()))?;
+
+    let mut command = Command::new(path); // 直接用完整路径创建
+    if *IS_APPIMAGE {
+        command.env_remove("LD_LIBRARY_PATH");
     }
+    Ok(command)
 }
 
 #[inline]
