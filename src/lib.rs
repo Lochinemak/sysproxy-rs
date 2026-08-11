@@ -66,6 +66,10 @@ pub enum Error {
     #[cfg(target_os = "windows")]
     #[error("Windows system call failed: {0}")]
     SystemCall(#[from] windows::Win32Error),
+
+    #[cfg(target_os = "linux")]
+    #[error("missing command `{0}`")]
+    MissingCommand(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

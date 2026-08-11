@@ -46,9 +46,9 @@ criterion = "0.7"
 name = "macos_behavior"
 harness = false
 
-[[bench]]
-name = "windows_behavior"
-harness = false
+# [[bench]]
+# name = "windows_behavior"
+# harness = false
 
 [features]
 default = ["iptools"]
