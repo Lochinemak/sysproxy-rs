@@ -114,6 +114,12 @@ pub struct WriteProgress {
 }
 
 impl WriteProgress {
+    /// Build progress for exercising consumer recovery paths.
+    #[inline]
+    pub const fn new(completed: u8, total: u8) -> Self {
+        Self { completed, total }
+    }
+
     /// Writes that were accepted by the OS before the failure.
     #[inline]
     pub const fn completed(&self) -> u8 {
