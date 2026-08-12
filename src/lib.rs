@@ -41,8 +41,10 @@ pub struct ProxySnapshot {
     pub http: ProxyEndpoint,
     /// HTTPS endpoint and whether it is on.
     pub https: ProxyEndpoint,
-    /// PAC URL and whether it is on.
+    /// PAC URL and whether it is on *and* usable.
     pub auto: Autoproxy,
+    /// Raw PAC switch, independent of URL usability.
+    pub auto_switched_on: bool,
     /// Bypass list, shared by all three protocols.
     pub bypass: String,
 }
@@ -52,15 +54,20 @@ pub struct ProxySnapshot {
 pub struct ProxyEndpoint {
     pub host: String,
     pub port: u16,
-    /// Whether this protocol is on *and* points somewhere usable.
+    /// Whether this protocol is on and has a usable endpoint.
     pub enable: bool,
+    /// Raw protocol switch, independent of endpoint usability.
+    pub switched_on: bool,
 }
 
 impl ProxySnapshot {
-    /// Whether the OS holds no usable proxy.
+    /// Whether every OS proxy switch is off.
     #[inline]
     pub fn is_all_disabled(&self) -> bool {
-        !self.socks.enable && !self.http.enable && !self.https.enable && !self.auto.enable
+        !self.socks.switched_on
+            && !self.http.switched_on
+            && !self.https.switched_on
+            && !self.auto_switched_on
     }
 
     /// Match an enabled target across all protocols, with PAC off.
@@ -79,19 +86,26 @@ impl ProxySnapshot {
         points_at(&self.socks)
             && points_at(&self.http)
             && points_at(&self.https)
-            && !self.auto.enable
-            && bypass_entries(&self.bypass) == bypass_entries(&target.bypass)
+            && !self.auto_switched_on
+            && self.bypass_matches(&target.bypass)
     }
 
     /// Match an enabled PAC target with every global protocol off.
     #[inline]
     pub fn matches_pac(&self, target: &Autoproxy) -> bool {
         target.enable
+            && self.auto_switched_on
             && self.auto.enable
             && self.auto.url == target.url
-            && !self.socks.enable
-            && !self.http.enable
-            && !self.https.enable
+            && !self.socks.switched_on
+            && !self.http.switched_on
+            && !self.https.switched_on
+    }
+
+    /// Compare bypass entries as a set; PAC writes must check this separately.
+    #[inline]
+    pub fn bypass_matches(&self, target: &str) -> bool {
+        bypass_entries(&self.bypass) == bypass_entries(target)
     }
 }
 
@@ -223,6 +237,16 @@ mod tests {
             host: "127.0.0.1".into(),
             port,
             enable,
+            switched_on: enable,
+        }
+    }
+
+    fn switched_on_pointing_nowhere() -> ProxyEndpoint {
+        ProxyEndpoint {
+            host: String::new(),
+            port: 0,
+            enable: false,
+            switched_on: true,
         }
     }
 
@@ -241,8 +265,48 @@ mod tests {
             http: endpoint(7890, true),
             https: endpoint(7890, true),
             auto: Autoproxy::default(),
+            auto_switched_on: false,
             bypass: "localhost,127.0.0.1,*.local".into(),
         }
+    }
+
+    fn all_off() -> ProxySnapshot {
+        ProxySnapshot {
+            socks: endpoint(0, false),
+            http: endpoint(0, false),
+            https: endpoint(0, false),
+            auto: Autoproxy::default(),
+            auto_switched_on: false,
+            bypass: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_switch_left_on_over_nothing_is_not_a_clean_machine() {
+        assert!(all_off().is_all_disabled());
+
+        let mut stranded = all_off();
+        stranded.http = switched_on_pointing_nowhere();
+        assert!(!stranded.is_all_disabled());
+
+        let mut stranded_pac = all_off();
+        stranded_pac.auto_switched_on = true;
+        assert!(!stranded_pac.is_all_disabled());
+    }
+
+    #[test]
+    fn a_pac_target_is_not_matched_while_a_global_switch_is_still_on() {
+        let pac = Autoproxy {
+            url: "http://127.0.0.1:1234/pac".into(),
+            enable: true,
+        };
+        let mut snapshot = all_off();
+        snapshot.auto = pac.clone();
+        snapshot.auto_switched_on = true;
+        assert!(snapshot.matches_pac(&pac));
+
+        snapshot.https = switched_on_pointing_nowhere();
+        assert!(!snapshot.matches_pac(&pac));
     }
 
     #[test]
@@ -256,6 +320,16 @@ mod tests {
         let mut wrong_port = all_on();
         wrong_port.http.port = 7891;
         assert!(!wrong_port.matches_global(&target()));
+    }
+
+    #[test]
+    fn a_pac_target_still_owns_the_bypass_list() {
+        let mut snapshot = all_on();
+        snapshot.bypass = "localhost,127.0.0.1,*.local".into();
+
+        assert!(snapshot.bypass_matches("*.local, 127.0.0.1 ,localhost"));
+        assert!(!snapshot.bypass_matches("localhost"));
+        assert!(!snapshot.bypass_matches(""));
     }
 
     #[test]
@@ -276,6 +350,7 @@ mod tests {
             url: "http://example.com/proxy.pac".into(),
             enable: true,
         };
+        with_pac.auto_switched_on = true;
         assert!(!with_pac.matches_global(&target()));
     }
 
@@ -287,6 +362,7 @@ mod tests {
         };
         let snapshot = ProxySnapshot {
             auto: pac.clone(),
+            auto_switched_on: true,
             ..ProxySnapshot::default()
         };
         assert!(snapshot.matches_pac(&pac));
@@ -294,6 +370,10 @@ mod tests {
         let mut with_socks = snapshot.clone();
         with_socks.socks = endpoint(7890, true);
         assert!(!with_socks.matches_pac(&pac));
+
+        let mut other_url = snapshot.clone();
+        other_url.auto.url = "http://127.0.0.1:2/pac".into();
+        assert!(!other_url.matches_pac(&pac));
     }
 
     #[test]
@@ -303,6 +383,7 @@ mod tests {
 
         let mut only_pac = ProxySnapshot::default();
         only_pac.auto.enable = true;
+        only_pac.auto_switched_on = true;
         assert!(!only_pac.is_all_disabled());
     }
 

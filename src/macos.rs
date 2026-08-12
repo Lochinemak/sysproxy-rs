@@ -127,20 +127,28 @@ impl Sysproxy {
             .build()
             .ok_or(Error::SCDynamicStore)?;
 
-        let endpoint = |proxy_type| -> Result<ProxyEndpoint> {
+        let endpoint = |proxy_type: ProxyType| -> Result<ProxyEndpoint> {
+            let switched_on = read_bool_flag(&proxies_dict, proxy_type.as_enable());
             let parsed = parse_proxies_from_dict(&proxies_dict, proxy_type)?;
             Ok(ProxyEndpoint {
                 host: parsed.host,
                 port: parsed.port,
                 enable: parsed.enable,
+                // Keep the raw switch before usability is folded in.
+                switched_on,
             })
         };
+
+        let (auto, auto_switched_on) =
+            get_autoproxy_and_switch_by_service_uuid(&store, &service_uuid)?;
 
         Ok(ProxySnapshot {
             socks: endpoint(ProxyType::Socks)?,
             http: endpoint(ProxyType::Http)?,
             https: endpoint(ProxyType::Https)?,
-            auto: get_autoproxies_by_service_uuid(&store, &service_uuid)?,
+            // PAC uses the same DynamicStore view as the PAC getter and guard.
+            auto,
+            auto_switched_on,
             bypass: parse_bypass_from_dict(&proxies_dict)?.join(","),
         })
     }
@@ -591,10 +599,11 @@ fn get_service_id_by_display_name(scp: &SCPreferences, name: &CFString) -> Optio
     None
 }
 
-fn get_autoproxies_by_service_uuid(
+/// Read PAC usability and its raw switch from one dictionary.
+fn get_autoproxy_and_switch_by_service_uuid(
     store: &SCDynamicStore,
     service_uuid: &CFString,
-) -> Result<Autoproxy> {
+) -> Result<(Autoproxy, bool)> {
     let proxy_key = CFString::new(&format!("Setup:/Network/Service/{}/Proxies", service_uuid));
 
     let proxies_cf_type = store
@@ -606,9 +615,20 @@ fn get_autoproxies_by_service_uuid(
         .ok_or_else(|| Error::ParseStr("Not a dictionary".into()))?;
 
     let proxies_dict: CFDictionary<CFString, CFType> =
-        unsafe { CFDictionary::wrap_under_get_rule(proxies_dict_raw.as_concrete_TypeRef() as _) };
+        unsafe { CFDictionary::wrap_under_get_rule(proxies_dict_raw.as_concrete_TypeRef()) };
 
-    parse_proxyauto_from_dict(&proxies_dict)
+    Ok((
+        parse_proxyauto_from_dict(&proxies_dict)?,
+        read_bool_flag(&proxies_dict, "ProxyAutoConfigEnable"),
+    ))
+}
+
+#[inline]
+fn get_autoproxies_by_service_uuid(
+    store: &SCDynamicStore,
+    service_uuid: &CFString,
+) -> Result<Autoproxy> {
+    get_autoproxy_and_switch_by_service_uuid(store, service_uuid).map(|(auto, _switched_on)| auto)
 }
 
 fn get_proxies_by_service_uuid(
