@@ -1,10 +1,7 @@
 use crate::{Autoproxy, Error, ProxyEndpoint, ProxySnapshot, Result, Sysproxy, WriteProgress};
 use log::debug;
 use std::process::{Command, Output, Stdio};
-use system_configuration::{
-    core_foundation::dictionary::CFDictionary, dynamic_store::SCDynamicStore,
-    preferences::SCPreferences,
-};
+use system_configuration::{core_foundation::dictionary::CFDictionary, preferences::SCPreferences};
 use system_configuration::{
     core_foundation::{array::CFArray, base::TCFType},
     network_configuration::SCNetworkService,
@@ -81,7 +78,7 @@ impl Sysproxy {
     pub fn get_system_proxy() -> Result<Sysproxy> {
         let service_uuid = get_active_network_service_uuid()?;
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
-        let proxies_dict = get_proxies_by_service_uuid(&scp, &service_uuid)?;
+        let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
 
         let mut socks = parse_proxies_from_dict(&proxies_dict, ProxyType::Socks)?;
         debug!("Getting SOCKS proxy: {:?}", socks);
@@ -116,16 +113,12 @@ impl Sysproxy {
 
     /// Read every protocol separately, plus PAC and the bypass list.
     ///
-    /// Protocols share the flattened getter's dictionary; PAC uses the dynamic store.
+    /// All fields come from one resolved dictionary for a consistent snapshot.
     #[inline]
     pub fn snapshot() -> Result<ProxySnapshot> {
         let service_uuid = get_active_network_service_uuid()?;
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
-        let proxies_dict = get_proxies_by_service_uuid(&scp, &service_uuid)?;
-
-        let store = SCDynamicStoreBuilder::new("sysproxy-rs")
-            .build()
-            .ok_or(Error::SCDynamicStore)?;
+        let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
 
         let endpoint = |proxy_type: ProxyType| -> Result<ProxyEndpoint> {
             let switched_on = read_bool_flag(&proxies_dict, proxy_type.as_enable());
@@ -139,16 +132,12 @@ impl Sysproxy {
             })
         };
 
-        let (auto, auto_switched_on) =
-            get_autoproxy_and_switch_by_service_uuid(&store, &service_uuid)?;
-
         Ok(ProxySnapshot {
             socks: endpoint(ProxyType::Socks)?,
             http: endpoint(ProxyType::Http)?,
             https: endpoint(ProxyType::Https)?,
-            // PAC uses the same DynamicStore view as the PAC getter and guard.
-            auto,
-            auto_switched_on,
+            auto: parse_proxyauto_from_dict(&proxies_dict)?,
+            auto_switched_on: read_bool_flag(&proxies_dict, "ProxyAutoConfigEnable"),
             bypass: parse_bypass_from_dict(&proxies_dict)?.join(","),
         })
     }
@@ -285,12 +274,12 @@ impl Sysproxy {
 
 impl Autoproxy {
     #[inline]
+    /// Read PAC settings from the resolved service dictionary.
     pub fn get_auto_proxy() -> Result<Autoproxy> {
-        let service = get_active_network_service_uuid()?;
-        let store = SCDynamicStoreBuilder::new("sysproxy-rs")
-            .build()
-            .ok_or(Error::SCDynamicStore)?;
-        get_autoproxies_by_service_uuid(&store, &service)
+        let service_uuid = get_active_network_service_uuid()?;
+        let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+        let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
+        parse_proxyauto_from_dict(&proxies_dict)
     }
 
     #[inline]
@@ -599,36 +588,27 @@ fn get_service_id_by_display_name(scp: &SCPreferences, name: &CFString) -> Optio
     None
 }
 
-/// Read PAC usability and its raw switch from one dictionary.
-fn get_autoproxy_and_switch_by_service_uuid(
-    store: &SCDynamicStore,
+/// Resolve one proxy dictionary, preferring preferences and falling back to DynamicStore.
+fn resolve_proxies_dict(
+    scp: &SCPreferences,
     service_uuid: &CFString,
-) -> Result<(Autoproxy, bool)> {
-    let proxy_key = CFString::new(&format!("Setup:/Network/Service/{}/Proxies", service_uuid));
+) -> Result<CFDictionary<CFString, CFType>> {
+    if let Ok(dict) = get_proxies_by_service_uuid(scp, service_uuid) {
+        return Ok(dict);
+    }
 
-    let proxies_cf_type = store
-        .get(proxy_key)
-        .ok_or_else(|| Error::ParseStr("Proxy settings not found in DynamicStore".into()))?;
-
+    let store = SCDynamicStoreBuilder::new("sysproxy-rs")
+        .build()
+        .ok_or(Error::SCDynamicStore)?;
+    let proxy_key = CFString::new(&format!("Setup:/Network/Service/{service_uuid}/Proxies"));
+    let proxies_cf_type = store.get(proxy_key).ok_or_else(|| {
+        Error::ParseStr("Proxy settings not found in preferences or DynamicStore".into())
+    })?;
     let proxies_dict_raw = proxies_cf_type
         .downcast_into::<CFDictionary>()
         .ok_or_else(|| Error::ParseStr("Not a dictionary".into()))?;
 
-    let proxies_dict: CFDictionary<CFString, CFType> =
-        unsafe { CFDictionary::wrap_under_get_rule(proxies_dict_raw.as_concrete_TypeRef()) };
-
-    Ok((
-        parse_proxyauto_from_dict(&proxies_dict)?,
-        read_bool_flag(&proxies_dict, "ProxyAutoConfigEnable"),
-    ))
-}
-
-#[inline]
-fn get_autoproxies_by_service_uuid(
-    store: &SCDynamicStore,
-    service_uuid: &CFString,
-) -> Result<Autoproxy> {
-    get_autoproxy_and_switch_by_service_uuid(store, service_uuid).map(|(auto, _switched_on)| auto)
+    Ok(unsafe { CFDictionary::wrap_under_get_rule(proxies_dict_raw.as_concrete_TypeRef()) })
 }
 
 fn get_proxies_by_service_uuid(
