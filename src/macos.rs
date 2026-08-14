@@ -1,14 +1,7 @@
-use crate::{Autoproxy, Error, Result, Sysproxy};
+use crate::{Autoproxy, Error, ProxyEndpoint, ProxySnapshot, Result, Sysproxy, WriteProgress};
 use log::debug;
-use std::{
-    borrow::Cow,
-    process::{Command, Output, Stdio},
-    str::from_utf8,
-};
-use system_configuration::{
-    core_foundation::dictionary::CFDictionary, dynamic_store::SCDynamicStore,
-    preferences::SCPreferences,
-};
+use std::process::{Command, Output, Stdio};
+use system_configuration::{core_foundation::dictionary::CFDictionary, preferences::SCPreferences};
 use system_configuration::{
     core_foundation::{array::CFArray, base::TCFType},
     network_configuration::SCNetworkService,
@@ -85,7 +78,7 @@ impl Sysproxy {
     pub fn get_system_proxy() -> Result<Sysproxy> {
         let service_uuid = get_active_network_service_uuid()?;
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
-        let proxies_dict = get_proxies_by_service_uuid(&scp, &service_uuid)?;
+        let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
 
         let mut socks = parse_proxies_from_dict(&proxies_dict, ProxyType::Socks)?;
         debug!("Getting SOCKS proxy: {:?}", socks);
@@ -118,6 +111,37 @@ impl Sysproxy {
         Ok(socks)
     }
 
+    /// Read every protocol separately, plus PAC and the bypass list.
+    ///
+    /// All fields come from one resolved dictionary for a consistent snapshot.
+    #[inline]
+    pub fn snapshot() -> Result<ProxySnapshot> {
+        let service_uuid = get_active_network_service_uuid()?;
+        let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+        let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
+
+        let endpoint = |proxy_type: ProxyType| -> Result<ProxyEndpoint> {
+            let switched_on = read_bool_flag(&proxies_dict, proxy_type.as_enable());
+            let parsed = parse_proxies_from_dict(&proxies_dict, proxy_type)?;
+            Ok(ProxyEndpoint {
+                host: parsed.host,
+                port: parsed.port,
+                enable: parsed.enable,
+                // Keep the raw switch before usability is folded in.
+                switched_on,
+            })
+        };
+
+        Ok(ProxySnapshot {
+            socks: endpoint(ProxyType::Socks)?,
+            http: endpoint(ProxyType::Http)?,
+            https: endpoint(ProxyType::Https)?,
+            auto: parse_proxyauto_from_dict(&proxies_dict)?,
+            auto_switched_on: read_bool_flag(&proxies_dict, "ProxyAutoConfigEnable"),
+            bypass: parse_bypass_from_dict(&proxies_dict)?.join(","),
+        })
+    }
+
     #[inline]
     pub fn set_system_proxy(&self) -> Result<()> {
         let service = get_active_network_service()?;
@@ -126,17 +150,20 @@ impl Sysproxy {
 
         debug!("Use network service: {}", service);
 
+        // Keep one progress counter across all protocol writes.
+        let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
         debug!("Setting SOCKS proxy");
-        self.set_socks(service)?;
+        set_proxy(&mut writes, self, ProxyType::Socks, service)?;
 
         debug!("Setting HTTPS proxy");
-        self.set_https(service)?;
+        set_proxy(&mut writes, self, ProxyType::Https, service)?;
 
         debug!("Setting HTTP proxy");
-        self.set_http(service)?;
+        set_proxy(&mut writes, self, ProxyType::Http, service)?;
 
         debug!("Setting bypass domains");
-        self.set_bypass(service)?;
+        set_bypass(&mut writes, self, service)?;
         Ok(())
     }
 
@@ -191,26 +218,44 @@ impl Sysproxy {
 
     #[inline]
     pub fn set_http(&self, service: &str) -> Result<()> {
-        set_proxy(self, ProxyType::Http, service)
+        set_proxy(
+            &mut WriteSequence::new(WRITES_PER_PROXY_TYPE),
+            self,
+            ProxyType::Http,
+            service,
+        )
     }
 
     #[inline]
     pub fn set_https(&self, service: &str) -> Result<()> {
-        set_proxy(self, ProxyType::Https, service)
+        set_proxy(
+            &mut WriteSequence::new(WRITES_PER_PROXY_TYPE),
+            self,
+            ProxyType::Https,
+            service,
+        )
     }
 
     #[inline]
     pub fn set_socks(&self, service: &str) -> Result<()> {
-        set_proxy(self, ProxyType::Socks, service)
+        set_proxy(
+            &mut WriteSequence::new(WRITES_PER_PROXY_TYPE),
+            self,
+            ProxyType::Socks,
+            service,
+        )
     }
 
     #[inline]
     pub fn set_bypass(&self, service: &str) -> Result<()> {
-        set_bypass(self, service)
+        set_bypass(&mut WriteSequence::new(BYPASS_WRITES), self, service)
     }
 
+    /// Try to lock `SCPreferences` without waiting.
+    ///
+    /// This does not predict whether authorized `networksetup` writes will succeed.
     #[inline]
-    pub fn has_permission() -> bool {
+    pub fn can_lock_scpreferences() -> bool {
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
         unsafe {
             let locked = SCPreferencesLock(scp.as_concrete_TypeRef(), 0);
@@ -218,7 +263,9 @@ impl Sysproxy {
                 SCPreferencesUnlock(scp.as_concrete_TypeRef());
                 true
             } else {
-                debug!("Permission check failed: SCPreferencesLock returned false");
+                debug!(
+                    "SCPreferencesLock returned false; this says nothing about write permission"
+                );
                 false
             }
         }
@@ -227,12 +274,12 @@ impl Sysproxy {
 
 impl Autoproxy {
     #[inline]
+    /// Read PAC settings from the resolved service dictionary.
     pub fn get_auto_proxy() -> Result<Autoproxy> {
-        let service = get_active_network_service_uuid()?;
-        let store = SCDynamicStoreBuilder::new("sysproxy-rs")
-            .build()
-            .ok_or(Error::SCDynamicStore)?;
-        get_autoproxies_by_service_uuid(&store, &service)
+        let service_uuid = get_active_network_service_uuid()?;
+        let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+        let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
+        parse_proxyauto_from_dict(&proxies_dict)
     }
 
     #[inline]
@@ -245,16 +292,66 @@ impl Autoproxy {
         } else {
             &self.url
         };
-        run_networksetup(&["-setautoproxyurl", service, url])?;
-        run_networksetup(&["-setautoproxystate", service, enable])?;
+        let mut writes = WriteSequence::new(AUTO_PROXY_WRITES);
+        writes.run(&["-setautoproxyurl", service, url])?;
+        writes.run(&["-setautoproxystate", service, enable])?;
 
         Ok(())
     }
 }
 
+/// Fixed path prevents `PATH` substitution in privileged callers.
+const NETWORKSETUP: &str = "/usr/sbin/networksetup";
+
+/// Admin-required exit code observed from `networksetup` on macOS 26.6.1.
+const EXIT_REQUIRES_ADMIN: i32 = 14;
+
+const WRITES_PER_PROXY_TYPE: u8 = 2;
+const SYSTEM_PROXY_WRITES: u8 = 3 * WRITES_PER_PROXY_TYPE + 1;
+const AUTO_PROXY_WRITES: u8 = 2;
+const BYPASS_WRITES: u8 = 1;
+
+/// Tracks accepted writes in one logical operation.
+struct WriteSequence {
+    completed: u8,
+    total: u8,
+}
+
+impl WriteSequence {
+    #[inline]
+    const fn new(total: u8) -> Self {
+        Self {
+            completed: 0,
+            total,
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, outcome: Result<()>) -> Result<()> {
+        match outcome {
+            Ok(()) => {
+                self.completed += 1;
+                Ok(())
+            }
+            Err(source) => Err(Error::ProxyWrite {
+                progress: WriteProgress {
+                    completed: self.completed,
+                    total: self.total,
+                },
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    #[inline]
+    fn run(&mut self, args: &[&str]) -> Result<()> {
+        self.record(run_networksetup(args))
+    }
+}
+
 #[inline]
-fn run_networksetup<'a>(args: &[&str]) -> Result<Cow<'a, str>> {
-    let output = Command::new("networksetup")
+fn run_networksetup(args: &[&str]) -> Result<()> {
+    let output = Command::new(NETWORKSETUP)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -264,18 +361,23 @@ fn run_networksetup<'a>(args: &[&str]) -> Result<Cow<'a, str>> {
 }
 
 #[inline]
-fn parse_networksetup_output<'a>(args: &[&str], output: Output) -> Result<Cow<'a, str>> {
-    let stdout = from_utf8(&output.stdout).map_err(|_| Error::ParseStr("output".into()))?;
-    let stderr = from_utf8(&output.stderr).map_err(|_| Error::ParseStr("error output".into()))?;
-
+fn parse_networksetup_output(args: &[&str], output: Output) -> Result<()> {
     if !output.status.success() {
+        // Keep the exit status usable even when failure output is not UTF-8.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // `networksetup` may report failures on either stream.
         let details = [stdout.trim(), stderr.trim()]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
 
-        if details.contains("requires admin privileges") {
+        // Match both signals; exit code 2 is an authentication failure, not missing privileges.
+        if details.contains("requires admin privileges")
+            || output.status.code() == Some(EXIT_REQUIRES_ADMIN)
+        {
             log::error!(
                 "Admin privileges required to run networksetup with args: {:?}, error: {}",
                 args,
@@ -296,26 +398,32 @@ fn parse_networksetup_output<'a>(args: &[&str], output: Output) -> Result<Cow<'a
         )));
     }
 
-    Ok(Cow::Owned(stdout.to_string()))
+    // Successful write output is unused and must not affect progress.
+    Ok(())
 }
 
 #[inline]
-fn set_proxy(proxy: &Sysproxy, proxy_type: ProxyType, service: &str) -> Result<()> {
+fn set_proxy(
+    writes: &mut WriteSequence,
+    proxy: &Sysproxy,
+    proxy_type: ProxyType,
+    service: &str,
+) -> Result<()> {
     let host = proxy.host.as_str();
     let port = format!("{}", proxy.port);
     let port = port.as_str();
 
-    run_networksetup(&[proxy_type.as_set_str(), service, host, port])?;
+    writes.run(&[proxy_type.as_set_str(), service, host, port])?;
 
     let enable = if proxy.enable { "on" } else { "off" };
 
-    run_networksetup(&[proxy_type.as_state_cmd(), service, enable])?;
+    writes.run(&[proxy_type.as_state_cmd(), service, enable])?;
 
     Ok(())
 }
 
 #[inline]
-fn set_bypass(proxy: &Sysproxy, service: &str) -> Result<()> {
+fn set_bypass(writes: &mut WriteSequence, proxy: &Sysproxy, service: &str) -> Result<()> {
     let mut args = vec!["-setproxybypassdomains", service];
     let domains: Vec<&str> = if proxy.bypass.is_empty() {
         Vec::new()
@@ -323,7 +431,7 @@ fn set_bypass(proxy: &Sysproxy, service: &str) -> Result<()> {
         proxy.bypass.split(",").collect()
     };
     args.extend(&domains);
-    run_networksetup(&args)?;
+    writes.run(&args)?;
     Ok(())
 }
 
@@ -480,24 +588,27 @@ fn get_service_id_by_display_name(scp: &SCPreferences, name: &CFString) -> Optio
     None
 }
 
-fn get_autoproxies_by_service_uuid(
-    store: &SCDynamicStore,
+/// Resolve one proxy dictionary, preferring preferences and falling back to DynamicStore.
+fn resolve_proxies_dict(
+    scp: &SCPreferences,
     service_uuid: &CFString,
-) -> Result<Autoproxy> {
-    let proxy_key = CFString::new(&format!("Setup:/Network/Service/{}/Proxies", service_uuid));
+) -> Result<CFDictionary<CFString, CFType>> {
+    if let Ok(dict) = get_proxies_by_service_uuid(scp, service_uuid) {
+        return Ok(dict);
+    }
 
-    let proxies_cf_type = store
-        .get(proxy_key)
-        .ok_or_else(|| Error::ParseStr("Proxy settings not found in DynamicStore".into()))?;
-
+    let store = SCDynamicStoreBuilder::new("sysproxy-rs")
+        .build()
+        .ok_or(Error::SCDynamicStore)?;
+    let proxy_key = CFString::new(&format!("Setup:/Network/Service/{service_uuid}/Proxies"));
+    let proxies_cf_type = store.get(proxy_key).ok_or_else(|| {
+        Error::ParseStr("Proxy settings not found in preferences or DynamicStore".into())
+    })?;
     let proxies_dict_raw = proxies_cf_type
         .downcast_into::<CFDictionary>()
         .ok_or_else(|| Error::ParseStr("Not a dictionary".into()))?;
 
-    let proxies_dict: CFDictionary<CFString, CFType> =
-        unsafe { CFDictionary::wrap_under_get_rule(proxies_dict_raw.as_concrete_TypeRef() as _) };
-
-    parse_proxyauto_from_dict(&proxies_dict)
+    Ok(unsafe { CFDictionary::wrap_under_get_rule(proxies_dict_raw.as_concrete_TypeRef()) })
 }
 
 fn get_proxies_by_service_uuid(
@@ -560,7 +671,9 @@ fn test_get_service_id_by_display_name() {
     println!("proxies: {:?}", proxies);
 }
 
+/// Destructive and machine-dependent: changes the real Wi-Fi bypass list without restoring it.
 #[test]
+#[ignore = "destructive: rewrites the machine's real Wi-Fi bypass list without restoring it"]
 fn test_set_bypass() {
     let proxy = Sysproxy {
         host: "proxy.example.com".into(),
@@ -570,8 +683,10 @@ fn test_set_bypass() {
     };
     let result = proxy.set_bypass("Wi-Fi");
     if let Err(e) = result {
-        assert!(matches!(e, Error::RequiresAdminPrivileges));
-        assert!(!Sysproxy::has_permission());
+        assert!(matches!(
+            leaf_error(&e),
+            Some(Error::RequiresAdminPrivileges)
+        ));
     }
 }
 
@@ -693,4 +808,210 @@ fn parse_proxyauto_disable_when_url_missing() {
     let auto = parse_proxyauto_from_dict(&dict).unwrap();
     assert!(!auto.enable);
     assert_eq!(auto.url, "");
+}
+
+/// Build an `ExitStatus` without running `networksetup`.
+#[cfg(test)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
+#[test]
+fn admin_failure_is_recognised_from_the_exit_code_alone() {
+    let output = Output {
+        status: exit_status(EXIT_REQUIRES_ADMIN),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+
+    assert!(matches!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+        Err(Error::RequiresAdminPrivileges)
+    ));
+}
+
+#[test]
+fn admin_failure_is_recognised_from_the_message_alone() {
+    let output = Output {
+        status: exit_status(1),
+        stdout: b"** Error: Command requires admin privileges.".to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert!(matches!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+        Err(Error::RequiresAdminPrivileges)
+    ));
+}
+
+#[test]
+fn authentication_failures_are_not_reported_as_missing_admin_rights() {
+    let output = Output {
+        status: exit_status(2),
+        stdout: b"** Error: An error occurred while authenticating.".to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert!(matches!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+        Err(Error::NetworkSetup(_))
+    ));
+}
+
+#[test]
+fn only_the_admin_exit_code_is_treated_as_a_privilege_failure() {
+    assert_eq!(EXIT_REQUIRES_ADMIN, 14);
+
+    for code in [13, 15] {
+        let output = Output {
+            status: exit_status(code),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+
+        assert!(
+            matches!(
+                parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+                Err(Error::NetworkSetup(_))
+            ),
+            "exit code {code} must not be classified as a privilege failure"
+        );
+    }
+}
+
+#[test]
+fn the_exit_code_still_classifies_when_the_output_is_not_valid_utf8() {
+    for (stdout, stderr) in [
+        (vec![0xff, 0xfe, 0x00], Vec::new()),
+        (Vec::new(), vec![0xff, 0xfe, 0x00]),
+    ] {
+        let output = Output {
+            status: exit_status(EXIT_REQUIRES_ADMIN),
+            stdout,
+            stderr,
+        };
+
+        assert!(matches!(
+            parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output),
+            Err(Error::RequiresAdminPrivileges)
+        ));
+    }
+}
+
+#[test]
+fn a_failure_before_any_write_reports_that_nothing_landed() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    assert!(
+        matches!(
+            &failure,
+            Some(Error::ProxyWrite { progress, .. })
+                if progress.nothing_written() && progress.total() == SYSTEM_PROXY_WRITES
+        ),
+        "unexpected failure shape: {failure:?}"
+    );
+}
+
+#[test]
+fn progress_counts_the_writes_that_already_landed() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    assert!(writes.record(Ok(())).is_ok());
+    assert!(writes.record(Ok(())).is_ok());
+    assert!(writes.record(Ok(())).is_ok());
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    assert!(
+        matches!(
+            &failure,
+            Some(Error::ProxyWrite { progress, .. })
+                if !progress.nothing_written() && progress.completed() == 3
+        ),
+        "unexpected failure shape: {failure:?}"
+    );
+}
+
+/// Return the first crate error in an error's source chain.
+#[cfg(test)]
+fn leaf_error(err: &Error) -> Option<&Error> {
+    use std::error::Error as StdError;
+
+    let mut current: Option<&(dyn StdError + 'static)> = StdError::source(err);
+    while let Some(source) = current {
+        if let Some(leaf) = source.downcast_ref::<Error>() {
+            return Some(leaf);
+        }
+        current = source.source();
+    }
+    None
+}
+
+#[test]
+fn the_underlying_failure_stays_reachable_through_the_source_chain() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    let reached = failure.as_ref().and_then(leaf_error);
+    assert!(
+        matches!(reached, Some(Error::RequiresAdminPrivileges)),
+        "leaf not reachable through the source chain: {failure:?}"
+    );
+}
+
+#[test]
+fn the_wrapper_does_not_repeat_the_leaf_message() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+    let rendered = failure.map(|err| err.to_string()).unwrap_or_default();
+
+    assert!(
+        !rendered.contains("admin privileges"),
+        "wrapper Display should not inline the leaf: {rendered}"
+    );
+    assert!(rendered.contains("0 of 7 writes completed"), "{rendered}");
+}
+
+#[test]
+fn a_successful_write_is_not_failed_by_output_it_cannot_decode() {
+    let output = Output {
+        status: exit_status(0),
+        stdout: vec![0xff, 0xfe, 0x00],
+        stderr: vec![0xff, 0xfe, 0x00],
+    };
+
+    assert!(
+        parse_networksetup_output(&["-setwebproxystate", "Wi-Fi", "off"], output).is_ok(),
+        "a command that exited 0 must be reported as success"
+    );
+}
+
+#[test]
+fn a_successful_write_advances_the_progress_counter() {
+    let mut writes = WriteSequence::new(SYSTEM_PROXY_WRITES);
+
+    let accepted = parse_networksetup_output(
+        &["-setwebproxystate", "Wi-Fi", "off"],
+        Output {
+            status: exit_status(0),
+            stdout: vec![0xff, 0xfe, 0x00],
+            stderr: Vec::new(),
+        },
+    );
+    assert!(writes.record(accepted).is_ok());
+
+    let failure = writes.record(Err(Error::RequiresAdminPrivileges)).err();
+
+    assert!(
+        matches!(
+            &failure,
+            Some(Error::ProxyWrite { progress, .. }) if progress.completed() == 1
+        ),
+        "unexpected failure shape: {failure:?}"
+    );
 }
