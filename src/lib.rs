@@ -193,6 +193,11 @@ pub enum Error {
     #[error("failed to interact with SCDynamicStore")]
     SCDynamicStore,
 
+    /// No service is primary: the machine is offline or mid network switch.
+    #[cfg(target_os = "macos")]
+    #[error("no active network service")]
+    NoActiveNetworkService,
+
     #[cfg(target_os = "macos")]
     #[error("networksetup failed: {0}")]
     NetworkSetup(String),

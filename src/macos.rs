@@ -466,7 +466,9 @@ fn get_active_network_service_uuid() -> Result<CFString> {
         .build()
         .ok_or(Error::SCDynamicStore)?;
     let global_ipv4_key = CFString::from_static_string("State:/Network/Global/IPv4");
-    let sets = store.get(global_ipv4_key).ok_or(Error::SCDynamicStore)?;
+    let sets = store
+        .get(global_ipv4_key)
+        .ok_or(Error::NoActiveNetworkService)?;
     if let Some(dict) = sets.downcast_into::<CFDictionary>() {
         let key = CFString::from_static_string("PrimaryService");
         let val_ptr = dict.find(key.as_CFTypeRef() as *const _);
@@ -475,7 +477,7 @@ fn get_active_network_service_uuid() -> Result<CFString> {
             return Ok(service_id_cf);
         }
     }
-    Err(Error::NetworkInterface)
+    Err(Error::NoActiveNetworkService)
 }
 
 fn parse_proxies_from_dict(
